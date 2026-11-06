@@ -13,10 +13,13 @@ from pathway.internals.helpers import with_optional_kwargs
 from pathway.internals.runtime_type_check import check_arg_types
 from pathway.internals.shadows import inspect
 from pathway.internals.udfs.caches import (
+    CacheStats,
     CacheStrategy,
     DefaultCache,
     DiskCache,
     InMemoryCache,
+    get_cache_stats,
+    reset_cache_stats,
     with_cache_strategy,
 )
 from pathway.internals.udfs.executors import (
@@ -48,10 +51,13 @@ __all__ = [
     "async_executor",
     "sync_executor",
     "fully_async_executor",
+    "CacheStats",
     "CacheStrategy",
     "DefaultCache",
     "DiskCache",
     "InMemoryCache",
+    "get_cache_stats",
+    "reset_cache_stats",
     "AsyncRetryStrategy",
     "ExponentialBackoffRetryStrategy",
     "FixedDelayRetryStrategy",

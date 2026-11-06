@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import os
 import pathlib
+import random
 import re
 import sys
 import threading
@@ -2137,3 +2139,578 @@ def test_batch_udf_across_completed_logical_times():
     assert sum(batch_sizes) == 1000
     # All times are supplied together; they should not force singleton UDF calls.
     assert len(batch_sizes) < 100
+
+
+def test_disk_cache_stats_sync(monkeypatch, tmp_path: pathlib.Path) -> None:
+    monkeypatch.setenv("PATHWAY_PERSISTENT_STORAGE", str(tmp_path))
+    internal_inc = mock.Mock()
+
+    def inc(a: int) -> int:
+        internal_inc(a)
+        return a + 1
+
+    cache = pw.udfs.DiskCache(name="disk_cache_stats_sync")
+    wrapped = pw.udfs.with_cache_strategy(inc, cache)
+
+    assert wrapped(1) == 2
+    assert wrapped(1) == 2  # hit
+    assert wrapped(2) == 3
+    assert wrapped(1) == 2  # hit
+
+    stats = cache.get_stats()
+    assert isinstance(stats, pw.udfs.CacheStats)
+    assert stats == pw.udfs.CacheStats(
+        name="disk_cache_stats_sync",
+        hits=2,
+        misses=2,
+        write_failures=0,
+        entries=2,
+    )
+    assert pw.udfs.get_cache_stats()["disk_cache_stats_sync"] == stats
+    # A snapshot is a frozen, point-in-time copy: later calls don't mutate it.
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        stats.hits = 0  # type: ignore[misc]
+    assert wrapped(3) == 4
+    assert cache.get_stats().hits == 2
+    assert stats.hits == 2
+
+    cache.reset_stats()
+    assert cache.get_stats() == pw.udfs.CacheStats(
+        name="disk_cache_stats_sync",
+        hits=0,
+        misses=0,
+        write_failures=0,
+        entries=3,  # resetting counters does not evict stored entries
+    )
+    assert wrapped(1) == 2  # served from cache after reset
+    assert cache.get_stats().hits == 1
+    assert internal_inc.call_count == 3
+
+
+def test_disk_cache_stats_async(monkeypatch, tmp_path: pathlib.Path) -> None:
+    monkeypatch.setenv("PATHWAY_PERSISTENT_STORAGE", str(tmp_path))
+    internal_inc = mock.Mock()
+
+    async def inc(a: int) -> int:
+        internal_inc(a)
+        return a + 1
+
+    cache = pw.udfs.DiskCache(name="disk_cache_stats_async")
+    wrapped = pw.udfs.with_cache_strategy(inc, cache)
+
+    async def run() -> None:
+        assert await wrapped(1) == 2
+        assert await wrapped(1) == 2
+        assert await wrapped(2) == 3
+
+    asyncio.run(run())
+
+    assert cache.get_stats() == pw.udfs.CacheStats(
+        name="disk_cache_stats_async",
+        hits=1,
+        misses=2,
+        write_failures=0,
+        entries=2,
+    )
+    assert internal_inc.call_count == 2
+
+
+def test_disk_cache_stats_exception_not_cached(
+    monkeypatch, tmp_path: pathlib.Path
+) -> None:
+    monkeypatch.setenv("PATHWAY_PERSISTENT_STORAGE", str(tmp_path))
+
+    def fail_on_zero(a: int) -> int:
+        if a == 0:
+            raise ValueError("zero is not allowed")
+        return a + 1
+
+    cache = pw.udfs.DiskCache(name="disk_cache_stats_exception")
+    wrapped = pw.udfs.with_cache_strategy(fail_on_zero, cache)
+
+    with pytest.raises(ValueError, match="zero is not allowed"):
+        wrapped(0)
+    with pytest.raises(ValueError, match="zero is not allowed"):
+        wrapped(0)  # exceptions are not cached: another miss
+    assert wrapped(1) == 2
+
+    stats = cache.get_stats()
+    assert (stats.hits, stats.misses, stats.write_failures, stats.entries) == (
+        0,
+        3,
+        0,
+        1,
+    )
+
+
+def test_disk_cache_stats_write_failure(monkeypatch, tmp_path: pathlib.Path) -> None:
+    monkeypatch.setenv("PATHWAY_PERSISTENT_STORAGE", str(tmp_path))
+
+    cache = pw.udfs.DiskCache(name="disk_cache_stats_write_failure", size_limit=10)
+    wrapped = pw.udfs.with_cache_strategy(lambda a: a + 1, cache)
+
+    with pytest.raises(KeyError):
+        wrapped(123456)
+    with pytest.raises(KeyError):
+        wrapped(123456)  # nothing was stored, so this misses again
+
+    stats = cache.get_stats()
+    assert (stats.hits, stats.misses, stats.write_failures, stats.entries) == (
+        0,
+        2,
+        2,
+        0,
+    )
+
+
+def test_default_cache_stats_disabled(monkeypatch, tmp_path: pathlib.Path) -> None:
+    monkeypatch.delenv("PATHWAY_PERSISTENT_STORAGE", raising=False)
+    internal_inc = mock.Mock()
+
+    def inc(a: int) -> int:
+        internal_inc(a)
+        return a + 1
+
+    cache = pw.udfs.DefaultCache(name="default_cache_stats_disabled")
+    wrapped = pw.udfs.with_cache_strategy(inc, cache)
+
+    assert wrapped(1) == 2
+    assert wrapped(1) == 2
+    # Bypasses of a disabled cache are neither hits nor misses.
+    stats = cache.get_stats()
+    assert (stats.hits, stats.misses, stats.write_failures, stats.entries) == (
+        0,
+        0,
+        0,
+        0,
+    )
+    assert internal_inc.call_count == 2
+
+    # Once the storage is configured, the same cache strategy starts counting.
+    monkeypatch.setenv("PATHWAY_PERSISTENT_STORAGE", str(tmp_path))
+    assert wrapped(1) == 2
+    assert wrapped(1) == 2
+    stats = cache.get_stats()
+    assert (stats.hits, stats.misses, stats.write_failures, stats.entries) == (
+        1,
+        1,
+        0,
+        1,
+    )
+
+
+def test_in_memory_cache_stats_sync() -> None:
+    internal_inc = mock.Mock()
+
+    def inc(a: int) -> int:
+        internal_inc(a)
+        return a + 1
+
+    cache = pw.udfs.InMemoryCache(name="in_memory_cache_stats_sync")
+    wrapped = pw.udfs.with_cache_strategy(inc, cache)
+
+    wrapped(1)
+    wrapped(1)  # hit
+    wrapped(2)
+    wrapped(1)  # hit
+
+    assert cache.get_stats() == pw.udfs.CacheStats(
+        name="in_memory_cache_stats_sync",
+        hits=2,
+        misses=2,
+        write_failures=0,
+        entries=2,
+    )
+    assert internal_inc.call_count == 2
+
+    cache.reset_stats()
+    assert cache.get_stats() == pw.udfs.CacheStats(
+        name="in_memory_cache_stats_sync",
+        hits=0,
+        misses=0,
+        write_failures=0,
+        entries=2,
+    )
+    wrapped(1)  # still served from cache after reset
+    assert cache.get_stats().hits == 1
+    assert internal_inc.call_count == 2
+
+
+def test_in_memory_cache_stats_eviction() -> None:
+    cache = pw.udfs.InMemoryCache(max_size=2, name="in_memory_cache_stats_eviction")
+    wrapped = pw.udfs.with_cache_strategy(lambda a: a + 1, cache)
+
+    wrapped(1)
+    wrapped(2)
+    wrapped(3)  # evicts 1
+    assert cache.get_stats() == pw.udfs.CacheStats(
+        name="in_memory_cache_stats_eviction",
+        hits=0,
+        misses=3,
+        write_failures=0,
+        entries=2,
+    )
+    wrapped(3)  # hit, keeps 3 most-recently used
+    assert cache.get_stats().hits == 1
+    wrapped(1)  # 1 was evicted: miss again, evicts 2
+    stats = cache.get_stats()
+    assert (stats.hits, stats.misses, stats.entries) == (1, 4, 2)
+    wrapped(2)  # 2 was evicted as well
+    assert cache.get_stats().misses == 5
+
+
+def test_in_memory_cache_stats_exception_not_cached() -> None:
+    def fail_on_zero(a: int) -> int:
+        if a == 0:
+            raise ValueError("zero is not allowed")
+        return a + 1
+
+    cache = pw.udfs.InMemoryCache(name="in_memory_cache_stats_exception")
+    wrapped = pw.udfs.with_cache_strategy(fail_on_zero, cache)
+
+    with pytest.raises(ValueError, match="zero is not allowed"):
+        wrapped(0)
+    with pytest.raises(ValueError, match="zero is not allowed"):
+        wrapped(0)
+    assert wrapped(1) == 2
+
+    stats = cache.get_stats()
+    assert (stats.hits, stats.misses, stats.write_failures, stats.entries) == (
+        0,
+        3,
+        0,
+        1,
+    )
+
+
+def test_in_memory_cache_stats_async() -> None:
+    cache = pw.udfs.InMemoryCache(name="in_memory_cache_stats_async")
+    internal_inc = mock.Mock()
+
+    async def inc(a: int) -> int:
+        internal_inc(a)
+        await asyncio.sleep(0.01)
+        return a + 1
+
+    wrapped = pw.udfs.with_cache_strategy(inc, cache)
+
+    async def run() -> None:
+        assert await wrapped(1) == 2
+        # Concurrent calls with the same missing key are coalesced: the UDF
+        # runs once (one miss) and the second lookup is served from the
+        # in-flight cache entry (one hit).
+        results = await asyncio.gather(wrapped(2), wrapped(2))
+        assert results == [3, 3]
+        assert await wrapped(2) == 3  # completed entry: ordinary hit
+
+    with new_event_loop() as event_loop:
+        event_loop.run_until_complete(run())
+        stats = cache.get_stats()
+
+    assert (stats.hits, stats.misses, stats.write_failures, stats.entries) == (
+        2,
+        2,
+        0,
+        2,
+    )
+    assert internal_inc.call_count == 2
+
+
+def test_in_memory_cache_stats_async_exception_not_cached() -> None:
+    cache = pw.udfs.InMemoryCache(name="in_memory_cache_stats_async_exception")
+
+    async def fail_on_zero(a: int) -> int:
+        if a == 0:
+            raise ValueError("zero is not allowed")
+        return a + 1
+
+    wrapped = pw.udfs.with_cache_strategy(fail_on_zero, cache)
+
+    async def run() -> None:
+        with pytest.raises(ValueError, match="zero is not allowed"):
+            await wrapped(0)
+        # Concurrent callers share the in-flight computation; its failed
+        # result is evicted, so retrying runs the UDF once more.
+        with pytest.raises(ValueError, match="zero is not allowed"):
+            await asyncio.gather(wrapped(0), wrapped(0))
+        assert await wrapped(1) == 2
+
+    with new_event_loop() as event_loop:
+        event_loop.run_until_complete(run())
+        stats = cache.get_stats()
+
+    # The coalesced failure accounts for 1 miss and 1 hit; no entry is kept.
+    assert (stats.hits, stats.misses, stats.write_failures, stats.entries) == (
+        1,
+        3,
+        0,
+        1,
+    )
+
+
+def test_cache_stats_unnamed_not_tracked() -> None:
+    disk_cache = pw.udfs.DiskCache()
+    memory_cache = pw.udfs.InMemoryCache()
+    named_cache = pw.udfs.InMemoryCache(name="unnamed_check_named_cache")
+    with pytest.raises(ValueError, match="explicit name"):
+        disk_cache.get_stats()
+    with pytest.raises(ValueError, match="explicit name"):
+        disk_cache.reset_stats()
+    with pytest.raises(ValueError, match="explicit name"):
+        memory_cache.get_stats()
+    with pytest.raises(ValueError, match="explicit name"):
+        memory_cache.reset_stats()
+
+    all_stats = pw.udfs.get_cache_stats()
+    assert all_stats["unnamed_check_named_cache"].entries == 0
+    for unnamed_cache in (disk_cache, memory_cache):
+        assert unnamed_cache not in all_stats.values()
+
+
+def test_named_cache_duplicate_name_rejected() -> None:
+    pw.udfs.DiskCache(name="duplicate_cache_name")
+    with pytest.raises(ValueError, match="duplicate_cache_name"):
+        pw.udfs.DiskCache(name="duplicate_cache_name")
+    # The name is shared across cache strategy types too.
+    with pytest.raises(ValueError, match="duplicate_cache_name"):
+        pw.udfs.InMemoryCache(name="duplicate_cache_name")
+
+
+def test_reset_cache_stats_registry(monkeypatch, tmp_path: pathlib.Path) -> None:
+    monkeypatch.setenv("PATHWAY_PERSISTENT_STORAGE", str(tmp_path))
+    disk_cache = pw.udfs.DiskCache(name="reset_registry_disk")
+    memory_cache = pw.udfs.InMemoryCache(name="reset_registry_memory")
+    disk_wrapped = pw.udfs.with_cache_strategy(lambda a: a + 1, disk_cache)
+    memory_wrapped = pw.udfs.with_cache_strategy(lambda a: a + 1, memory_cache)
+
+    disk_wrapped(1)
+    disk_wrapped(1)
+    memory_wrapped(1)
+    memory_wrapped(1)
+
+    assert disk_cache.get_stats().misses == 1
+    assert memory_cache.get_stats().misses == 1
+
+    with pytest.raises(ValueError, match="no named cache"):
+        pw.udfs.reset_cache_stats("cache_name_that_does_not_exist")
+
+    pw.udfs.reset_cache_stats("reset_registry_disk")
+    assert disk_cache.get_stats().hits == 0
+    assert disk_cache.get_stats().entries == 1
+    assert memory_cache.get_stats().hits == 1  # untouched
+
+    pw.udfs.reset_cache_stats()
+    assert disk_cache.get_stats().hits == 0
+    assert memory_cache.get_stats() == pw.udfs.CacheStats(
+        name="reset_registry_memory",
+        hits=0,
+        misses=0,
+        write_failures=0,
+        entries=1,  # entries survive a reset
+    )
+
+
+def test_disk_cache_stats_concurrent_calls(monkeypatch, tmp_path: pathlib.Path) -> None:
+    monkeypatch.setenv("PATHWAY_PERSISTENT_STORAGE", str(tmp_path))
+    call_count = 0
+    count_lock = threading.Lock()
+
+    def inc(a: int) -> int:
+        nonlocal call_count
+        with count_lock:
+            call_count += 1
+        time.sleep(0.001)
+        return a + 1
+
+    cache = pw.udfs.DiskCache(name="disk_cache_stats_concurrent")
+    wrapped = pw.udfs.with_cache_strategy(inc, cache)
+    for value in range(4):
+        wrapped(value)  # warm-up also initializes the cache storage
+
+    total_calls = 0
+    call_lock = threading.Lock()
+
+    def worker() -> None:
+        nonlocal total_calls
+        for _ in range(50):
+            wrapped(random.randrange(8))
+            with call_lock:
+                total_calls += 1
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    stats = cache.get_stats()
+    # Every lookup is counted exactly once, even under concurrency.
+    assert stats.hits + stats.misses == total_calls + 4
+    assert stats.write_failures == 0
+    assert stats.entries == 8
+    # The disk cache does not coalesce concurrent misses: keys seen for the
+    # first time concurrently are computed by every racing caller.
+    assert stats.misses >= 8
+
+
+def test_in_memory_cache_stats_concurrent_calls() -> None:
+    def inc(a: int) -> int:
+        time.sleep(0.001)
+        return a + 1
+
+    cache = pw.udfs.InMemoryCache(name="in_memory_cache_stats_concurrent")
+    wrapped = pw.udfs.with_cache_strategy(inc, cache)
+    for value in range(8):
+        wrapped(value)
+
+    total_calls = 0
+    call_lock = threading.Lock()
+
+    def worker() -> None:
+        nonlocal total_calls
+        for _ in range(50):
+            wrapped(random.randrange(8))
+            with call_lock:
+                total_calls += 1
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    stats = cache.get_stats()
+    assert stats.hits + stats.misses == total_calls + 8
+    assert stats.misses == 8
+    assert stats.entries == 8
+    assert stats.write_failures == 0
+
+
+@pytest.mark.parametrize(
+    "sync",
+    [
+        "sync",
+        "async",
+        pytest.param(
+            "fully_async",
+            marks=pytest.mark.xfail(
+                sys.platform != "linux", reason="InMemoryCache uses incompatible loop"
+            ),
+        ),
+    ],
+)
+def test_udf_in_memory_named_cache_stats(sync: str) -> None:
+    internal_inc = mock.Mock()
+    cache_name = f"udf_in_memory_named_stats_{sync}"
+
+    if sync == "sync":
+
+        @pw.udf(
+            cache_strategy=pw.udfs.InMemoryCache(name=cache_name),
+        )
+        def inc(a: int) -> int:
+            internal_inc(a)
+            return a + 1
+
+    else:
+
+        @pw.udf(
+            cache_strategy=pw.udfs.InMemoryCache(name=cache_name),
+            executor=get_async_executor(sync == "fully_async"),
+        )
+        async def inc(a: int) -> int:
+            await asyncio.sleep(a / 100)
+            internal_inc(a)
+            return a + 1
+
+    with new_event_loop() as event_loop:
+        input = pw.debug.table_from_markdown(
+            """
+            a
+            1
+            2
+            1
+            2
+            3
+        """
+        )
+        result = input.select(ret=inc(pw.this.a))
+        if sync == "fully_async":
+            result = result.await_futures()
+        assert_table_equality(
+            result,
+            T(
+                """
+                ret
+                2
+                3
+                2
+                3
+                4
+                """
+            ),
+            event_loop=event_loop,
+        )
+        stats = pw.udfs.get_cache_stats()[cache_name]
+
+    assert (stats.hits, stats.misses, stats.write_failures, stats.entries) == (
+        2,
+        3,
+        0,
+        3,
+    )
+    assert internal_inc.call_count == 3
+
+
+@xfail_on_multiple_threads
+def test_udf_disk_named_cache_stats(monkeypatch, tmp_path: pathlib.Path) -> None:
+    monkeypatch.delenv("PATHWAY_PERSISTENT_STORAGE", raising=False)
+    internal_inc = mock.Mock()
+
+    cache = pw.udfs.DiskCache(name="udf_disk_named_stats")
+
+    @pw.udf(deterministic=True, cache_strategy=cache)
+    def inc(a: int) -> int:
+        internal_inc(a)
+        return a + 1
+
+    input = T(
+        """
+        a
+        1
+        2
+        2
+        3
+        1
+        """
+    )
+    result = input.select(ret=inc(pw.this.a))
+
+    pstorage_dir = tmp_path / "PStorage"
+    persistence_config = pw.persistence.Config(
+        backend=pw.persistence.Backend.filesystem(pstorage_dir),
+        persistence_mode=api.PersistenceMode.UDF_CACHING,
+    )
+    assert_table_equality(
+        result,
+        T(
+            """
+            ret
+            2
+            3
+            3
+            4
+            2
+            """
+        ),
+        persistence_config=persistence_config,
+    )
+
+    stats = cache.get_stats()
+    assert (stats.hits, stats.misses, stats.write_failures, stats.entries) == (
+        2,
+        3,
+        0,
+        3,
+    )
+    assert internal_inc.call_count == 3
