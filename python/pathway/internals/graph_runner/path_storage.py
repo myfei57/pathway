@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import enum
 from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import cached_property
@@ -10,6 +11,31 @@ from functools import cached_property
 from pathway.internals.column import Column, IdColumn
 from pathway.internals.column_path import ColumnPath
 from pathway.internals.universe import Universe
+
+
+class ColumnVisibilityKind(enum.Enum):
+    """Visibility status of a column queried from a Storage."""
+
+    VISIBLE = enum.auto()
+    """Ordinary column present in the visible column mapping."""
+
+    KEY = enum.auto()
+    """ID column of the Storage's universe, addressed via ColumnPath.KEY."""
+
+    HIDDEN = enum.auto()
+    """Not visible, but still present in the physical tuple (e.g. hidden from
+    the visible column mapping by restrict_to)."""
+
+    ABSENT = enum.auto()
+    """Neither visible nor present in the physical tuple."""
+
+
+@dataclass(frozen=True)
+class ColumnVisibility:
+    kind: ColumnVisibilityKind
+    path: ColumnPath | None
+    """ColumnPath of a visible column, ColumnPath.KEY for an ID key column of
+    the Storage's universe, None for invisible columns."""
 
 
 @dataclass(eq=False, frozen=True)
@@ -66,6 +92,43 @@ class Storage:
             return ColumnPath.KEY
         else:
             raise KeyError(f"Column {column} not found in Storage {self}.")
+
+    def check_columns_visibility(
+        self, columns: Iterable[Column]
+    ) -> list[ColumnVisibility]:
+        """Read-only visibility check of the given columns.
+
+        For every queried column, reports (in the same order, with duplicates
+        kept in their original positions) whether the column is:
+
+        - an ordinary visible column: ``ColumnVisibilityKind.VISIBLE`` with
+          the column's ColumnPath,
+        - the ID key column of this Storage's universe:
+          ``ColumnVisibilityKind.KEY`` with ColumnPath.KEY,
+        - invisible: ``ColumnVisibilityKind.HIDDEN`` if the column is still
+          present in the physical tuple but hidden from the visible column
+          mapping (in particular, by restrict_to), or
+          ``ColumnVisibilityKind.ABSENT`` if it is not in the tuple at all;
+          the path is None in both cases.
+
+        Only the existing column mappings are read: no dataflow is run, no row
+        values are accessed and the Storage is not modified.
+        """
+        columns_in_tuple = set(self._all_columns.values())
+        result: list[ColumnVisibility] = []
+        for column in columns:
+            if column in self._column_paths:
+                visibility = ColumnVisibility(
+                    ColumnVisibilityKind.VISIBLE, self._column_paths[column]
+                )
+            elif isinstance(column, IdColumn) and column.universe == self._universe:
+                visibility = ColumnVisibility(ColumnVisibilityKind.KEY, ColumnPath.KEY)
+            elif column in columns_in_tuple:
+                visibility = ColumnVisibility(ColumnVisibilityKind.HIDDEN, None)
+            else:
+                visibility = ColumnVisibility(ColumnVisibilityKind.ABSENT, None)
+            result.append(visibility)
+        return result
 
     @cached_property
     def max_depth(self) -> int:
