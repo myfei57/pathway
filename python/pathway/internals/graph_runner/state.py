@@ -2,10 +2,29 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 
 from pathway.internals import api, column, table, universe
+from pathway.internals.checkpoint import (
+    Checkpoint,
+    CheckpointController,
+    CheckpointState,
+    CheckpointStore,
+    InMemoryCheckpointStore,
+    fingerprint_schema,
+)
 from pathway.internals.graph_runner.path_storage import Storage
+
+__all__ = [
+    "Checkpoint",
+    "CheckpointController",
+    "CheckpointState",
+    "CheckpointStore",
+    "InMemoryCheckpointStore",
+    "OutOfScopeError",
+    "ScopeState",
+    "fingerprint_schema",
+]
 
 
 class OutOfScopeError(RuntimeError):
@@ -21,7 +40,11 @@ class ScopeState:
     storages: dict[universe.Universe, Storage]
     error_logs: dict[table.Table, api.ErrorLog]
 
-    def __init__(self, scope: api.Scope) -> None:
+    def __init__(
+        self,
+        scope: api.Scope,
+        checkpoint_controller: CheckpointController | None = None,
+    ) -> None:
         self.scope = scope
         self.columns = {}
         self.universes = {}
@@ -30,6 +53,55 @@ class ScopeState:
         self.tables = {}
         self.storages = {}
         self.error_logs = {}
+        self._checkpoint_controller = checkpoint_controller
+
+    @property
+    def checkpoint_controller(self) -> CheckpointController:
+        """Lazily created controller governing pausable checkpoints of this scope."""
+        if self._checkpoint_controller is None:
+            self._checkpoint_controller = CheckpointController(
+                store=InMemoryCheckpointStore()
+            )
+        return self._checkpoint_controller
+
+    @property
+    def checkpoint_state(self) -> CheckpointState:
+        """Current pause/persist/resume/cancel state of this scope."""
+        if self._checkpoint_controller is None:
+            return CheckpointState.RUNNING
+        return self._checkpoint_controller.state
+
+    def register_checkpoint_input(
+        self,
+        input_id: str,
+        schema: Mapping[str, object] | str | None = None,
+    ) -> CheckpointController:
+        """Register a (possibly multi-input) dataflow input for checkpointing."""
+        self.checkpoint_controller.register_input(input_id, schema)
+        return self._checkpoint_controller  # type: ignore[return-value]
+
+    def request_pause(self) -> CheckpointState:
+        """Request pausing at the next safe frontier (RUNNING -> PAUSING)."""
+        return self.checkpoint_controller.request_pause()
+
+    def persist_checkpoint(self) -> Checkpoint:
+        """Persist the current safe frontier without pausing."""
+        return self.checkpoint_controller.persist_checkpoint()
+
+    def resume_checkpoint(
+        self,
+        *,
+        schemas: Mapping[str, Mapping[str, object] | str | None] | None = None,
+        allow_schema_change: bool = False,
+    ) -> Checkpoint:
+        """Restore the last valid checkpoint and resume processing."""
+        return self.checkpoint_controller.resume(
+            schemas=schemas, allow_schema_change=allow_schema_change
+        )
+
+    def cancel_checkpoint(self) -> CheckpointState:
+        """Cancel the dataflow (terminal state)."""
+        return self.checkpoint_controller.cancel()
 
     def extract_universe(self, univ: universe.Universe) -> api.Universe:
         engine_table = self.get_table(univ)

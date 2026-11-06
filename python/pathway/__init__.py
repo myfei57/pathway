@@ -72,6 +72,7 @@ from pathway.internals import (
     wrap_py_object,
 )
 from pathway.internals.api import PathwayType as Type, PersistenceMode
+from pathway.internals.checkpoint import CheckpointController, CheckpointState
 from pathway.internals.custom_reducers import BaseCustomAccumulator
 from pathway.schema import schema_builder
 from pathway.stdlib import (
@@ -165,6 +166,8 @@ __all__ = [
     "stateful",
     "viz",
     "PersistenceMode",
+    "CheckpointState",
+    "CheckpointController",
     "join",
     "join_inner",
     "join_left",

@@ -4,13 +4,20 @@ from __future__ import annotations
 
 import functools
 import warnings
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast, overload
 
 import pathway.internals.column as clmn
 import pathway.internals.expression as expr
 from pathway.engine import ExternalIndexFactory
 from pathway.internals import api, dtype as dt, groupbys, thisclass, universes
+from pathway.internals.checkpoint import (
+    Checkpoint,
+    CheckpointController,
+    CheckpointState,
+    CheckpointStore,
+    fingerprint_schema,
+)
 from pathway.internals.api import Value
 from pathway.internals.arg_handlers import (
     arg_handler,
@@ -108,6 +115,8 @@ class Table(
     _rowwise_context: clmn.RowwiseContext
     _source: SetOnceProperty[OutputHandle] = SetOnceProperty()
     """Lateinit by operator."""
+    _checkpoint_controller: CheckpointController | None = None
+    """Controller of the pausable checkpoint attached to this table."""
 
     def __init__(
         self,
@@ -2486,6 +2495,123 @@ id_type=<class 'pathway.engine.Pointer'>>
         universe = self._universe
         if not hasattr(universe, "lineage"):
             universe.lineage = clmn.Lineage(source=source)
+
+    # ------------------------------------------------------------------
+    # Pausable checkpoints
+    # ------------------------------------------------------------------
+
+    def _default_checkpoint_input_name(self) -> str:
+        return f"table-{self._universe}"
+
+    def _schema_fingerprint(self) -> str:
+        """Stable fingerprint of the table schema (columns, id type, pkeys)."""
+        columns = {
+            name: str(column.dtype) for name, column in self._schema.columns().items()
+        }
+        primary_key = self._schema.primary_key_columns()
+        payload = {
+            "columns": columns,
+            "id_dtype": str(self._schema.id_type),
+            "primary_key": primary_key or [],
+        }
+        return cast(str, fingerprint_schema(payload))
+
+    @property
+    def checkpoint_controller(self) -> CheckpointController:
+        """Controller of the pausable checkpoint; lazily enabled per table."""
+        if self._checkpoint_controller is None:
+            self.enable_checkpointing()
+        return cast(CheckpointController, self._checkpoint_controller)
+
+    def enable_checkpointing(
+        self,
+        *,
+        store: CheckpointStore | None = None,
+        input_name: str | None = None,
+        extra_inputs: Iterable[str] = (),
+    ) -> CheckpointController:
+        """Enable pausable checkpoints with this table as the first input.
+
+        Args:
+            store: checkpoint storage backend (defaults to an in-memory
+                store; pass ``pw.persistence``-style stores to survive
+                restarts).
+            input_name: name under which this table's input is tracked.
+            extra_inputs: names of additional inputs sharing the same
+                checkpoint frontier (multi-input dataflows).
+
+        Returns:
+            The shared :class:`CheckpointController`.
+        """
+        controller = CheckpointController(store=store)
+        name = input_name or self._default_checkpoint_input_name()
+        controller.register_input(name, self._schema_fingerprint())
+        for extra_name in extra_inputs:
+            controller.register_input(extra_name)
+        self._checkpoint_controller = controller
+        return controller
+
+    def attach_checkpoint(
+        self,
+        controller: CheckpointController,
+        *,
+        input_name: str | None = None,
+    ) -> CheckpointController:
+        """Attach this table (as another input) to a shared controller.
+
+        Several tables feeding the same dataflow should attach to the same
+        controller, so the pause frontier spans every input.
+        """
+        name = input_name or self._default_checkpoint_input_name()
+        controller.register_input(name, self._schema_fingerprint())
+        self._checkpoint_controller = controller
+        return controller
+
+    @property
+    def checkpoint_state(self) -> CheckpointState:
+        """Pause / persist / resume / cancel state of this table."""
+        if self._checkpoint_controller is None:
+            return CheckpointState.RUNNING
+        return self._checkpoint_controller.state
+
+    def request_pause(self) -> CheckpointState:
+        """Request a pause; it takes effect only at the next safe frontier."""
+        return self.checkpoint_controller.request_pause()
+
+    def persist_checkpoint(self) -> Checkpoint:
+        """Persist the current safe frontier without pausing."""
+        return self.checkpoint_controller.persist_checkpoint()
+
+    def resume_checkpoint(
+        self,
+        *,
+        schemas: Mapping[str, Mapping[str, object] | str | None] | None = None,
+        allow_schema_change: bool = False,
+    ) -> Checkpoint:
+        """Restore the last valid checkpoint without re-emitting confirmed changes."""
+        return self.checkpoint_controller.resume(
+            schemas=schemas, allow_schema_change=allow_schema_change
+        )
+
+    def cancel_checkpoint(self) -> CheckpointState:
+        """Cancel the dataflow; the last valid checkpoint is retained."""
+        return self.checkpoint_controller.cancel()
+
+    def is_change_confirmed(self, change_id: Any) -> bool:
+        """Whether output for ``change_id`` was already confirmed downstream."""
+        if self._checkpoint_controller is None:
+            return False
+        return self._checkpoint_controller.is_confirmed(
+            self._default_checkpoint_input_name(), change_id
+        )
+
+    def filter_unconfirmed(self, change_ids: Iterable[Any]) -> list[Any]:
+        """Drop changes already confirmed, so resume never duplicates output."""
+        if self._checkpoint_controller is None:
+            return list(change_ids)
+        return self._checkpoint_controller.filter_unconfirmed(
+            change_ids, input_id=self._default_checkpoint_input_name()
+        )
 
     @contextualized_operator
     def _unsafe_promise_universe(self, other: TableLike) -> Table:

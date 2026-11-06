@@ -8,6 +8,38 @@ from dataclasses import KW_ONLY, dataclass
 
 from pathway.internals import api
 from pathway.internals._io_helpers import AwsS3Settings
+from pathway.internals.checkpoint import (
+    Checkpoint,
+    CheckpointController,
+    CheckpointError,
+    CheckpointPersistError,
+    CheckpointState,
+    CheckpointStore,
+    FileSystemCheckpointStore,
+    InMemoryCheckpointStore,
+    IncompatibleSchemaError,
+    InvalidCheckpointTransition,
+    LateChange,
+    fingerprint_schema,
+)
+
+__all__ = [
+    "Backend",
+    "Checkpoint",
+    "CheckpointController",
+    "CheckpointError",
+    "CheckpointPersistError",
+    "CheckpointState",
+    "CheckpointStore",
+    "Config",
+    "FileSystemCheckpointStore",
+    "InMemoryCheckpointStore",
+    "IncompatibleSchemaError",
+    "InvalidCheckpointTransition",
+    "LateChange",
+    "fingerprint_schema",
+    "get_persistence_engine_config",
+]
 
 
 class Backend:
